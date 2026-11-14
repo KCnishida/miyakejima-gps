@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#101820">
+<title>三宅島 GPS航跡</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { color-scheme: dark; --bg:#101820; --panel:#1b2732; --line:#334554; --text:#f4f7fa; --muted:#aebdca; --green:#20b879; --red:#e45b5b; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; width:100%; height:100%; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans",sans-serif; overflow:hidden; }
+  #app { height:100%; display:flex; flex-direction:column; padding-top:env(safe-area-inset-top); padding-bottom:env(safe-area-inset-bottom); }
+  header { padding:10px 14px 8px; background:var(--bg); display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  header strong { font-size:16px; letter-spacing:.02em; }
+  #gpsState { font-size:12px; color:var(--muted); }
+  #map { flex:1; min-height:160px; width:100%; background:#dfe6e9; }
+  #panel { background:var(--panel); padding:10px 12px calc(12px + env(safe-area-inset-bottom)); border-top:1px solid var(--line); }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin-bottom:10px; }
+  .stat { background:#111b23; border-radius:9px; padding:8px 9px; min-width:0; }
+  .stat span { display:block; color:var(--muted); font-size:10px; margin-bottom:3px; }
+  .stat b { display:block; font-size:14px; font-variant-numeric:tabular-nums; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .buttons { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+  button { min-height:44px; border:0; border-radius:10px; color:white; font-size:14px; font-weight:650; background:#3a5265; }
+  button.primary { background:var(--green); color:#062416; }
+  button.warn { background:#8a4141; }
+  button:disabled { opacity:.4; }
+  .subrow { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:9px; color:var(--muted); font-size:12px; }
+  .subrow label { display:flex; align-items:center; gap:6px; }
+  input { accent-color:var(--green); }
+  #message { min-height:16px; color:var(--muted); font-size:11px; margin-top:7px; line-height:1.4; }
+  .gps-dot { width:18px; height:18px; border-radius:50%; background:#168cff; border:3px solid white; box-shadow:0 0 0 2px #168cff; }
+  .leaflet-control-attribution { font-size:9px !important; }
+  @media (min-width:700px) { #panel { padding-left:20px; padding-right:20px; } .buttons { max-width:620px; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <strong>三宅島 GPS航跡</strong>
+    <span id="gpsState">GPS未開始</span>
+  </header>
+  <div id="map"></div>
+  <section id="panel">
+    <div class="stats">
+      <div class="stat"><span>緯度</span><b id="lat">---</b></div>
+      <div class="stat"><span>経度</span><b id="lon">---</b></div>
+      <div class="stat"><span>GPS精度</span><b id="accuracy">---</b></div>
+      <div class="stat"><span>速度</span><b id="speed">---</b></div>
+      <div class="stat"><span>記録点数</span><b id="points">0</b></div>
+      <div class="stat"><span>航跡距離</span><b id="distance">0.00 km</b></div>
+    </div>
+    <div class="buttons">
+      <button id="start" class="primary">記録開始</button>
+      <button id="pause" disabled>一時停止</button>
+      <button id="finish" class="warn" disabled>終了・CSV保存</button>
+    </div>
+    <div class="subrow">
+      <label><input type="checkbox" id="follow" checked> 現在地に追従</label>
+      <button id="center" style="min-height:32px;padding:0 12px;font-size:12px;">現在地へ移動</button>
+    </div>
+    <div id="message">記録開始を押して、位置情報の利用を許可してください。</div>
+  </section>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(() => {
+  "use strict";
+  const STORAGE_KEY = "miyakejima_gps_track_v1";
+  const islandCenter = [34.08, 139.52];
+  const map = L.map("map", { zoomControl:false }).setView(islandCenter, 12);
+
+  const pale = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", {
+    maxZoom:18, attribution:'<a href="https://maps.gsi.go.jp/development/">地理院タイル（国土地理院）</a>'
+  }).addTo(map);
+
+  const relief = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/sekisyokurittai_miyakejima/{z}/{x}/{y}.png", {
+    minZoom:2, maxZoom:18, opacity:0.92,
+    attribution:'三宅島 赤色立体地図：国土地理院タイル（第三者作成データ）'
+  }).addTo(map);
+  L.control.layers({"地理院 淡色地図":pale}, {"三宅島 赤色立体地図":relief}, {collapsed:true}).addTo(map);
+  L.control.zoom({position:"topright"}).addTo(map);
+
+  const trackLine = L.polyline([], {color:"#087cff", weight:4, opacity:.95}).addTo(map);
+  const currentIcon = L.divIcon({className:"", html:'<div class="gps-dot"></div>', iconSize:[18,18], iconAnchor:[9,9]});
+  let currentMarker = null, accuracyCircle = null;
+  let watchId = null, recording = false, paused = false;
+  let track = loadTrack();
+  let lastPoint = track.length ? track[track.length-1] : null;
+
+  function $(id){ return document.getElementById(id); }
+  function loadTrack(){
+    try { const v = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+    catch(e){ return []; }
+  }
+  function saveTrack(){
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(track)); }
+    catch(e){ $("message").textContent = "保存容量が不足しています。CSVを保存してください。"; }
+  }
+  function haversine(a,b){
+    const R=6371000, rad=x=>x*Math.PI/180;
+    const dLat=rad(b.lat-a.lat), dLon=rad(b.lon-a.lon);
+    const x=Math.sin(dLat/2)**2 + Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dLon/2)**2;
+    return 2*R*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+  }
+  function totalDistance(){
+    let d=0; for(let i=1;i<track.length;i++) d+=haversine(track[i-1],track[i]); return d;
+  }
+  function updateStats(pos){
+    const c=pos.coords;
+    $("lat").textContent=c.latitude.toFixed(6);
+    $("lon").textContent=c.longitude.toFixed(6);
+    $("accuracy").textContent="±"+Math.round(c.accuracy)+" m";
+    $("speed").textContent=c.speed==null ? "---" : (c.speed*1.94384).toFixed(1)+" kn";
+    $("points").textContent=track.length.toLocaleString("ja-JP");
+    $("distance").textContent=(totalDistance()/1000).toFixed(2)+" km";
+  }
+  function onPosition(pos){
+    const c=pos.coords;
+    const p={lat:c.latitude, lon:c.longitude, time:new Date(pos.timestamp).toISOString(), accuracy:c.accuracy, speed:c.speed, heading:c.heading};
+    if(!currentMarker) currentMarker=L.marker([p.lat,p.lon],{icon:currentIcon}).addTo(map);
+    else currentMarker.setLatLng([p.lat,p.lon]);
+    if(accuracyCircle) accuracyCircle.setLatLng([p.lat,p.lon]).setRadius(c.accuracy);
+    else accuracyCircle=L.circle([p.lat,p.lon],{radius:c.accuracy,color:"#168cff",weight:1,fillOpacity:.08}).addTo(map);
+    if(recording){
+      const elapsed=lastPoint ? (Date.parse(p.time)-Date.parse(lastPoint.time))/1000 : Infinity;
+      const moved=lastPoint ? haversine(lastPoint,p) : Infinity;
+      // GPSの細かな揺れを抑え、3m以上または5秒経過で記録
+      if(!lastPoint || moved>=3 || elapsed>=5){
+        track.push(p); lastPoint=p; saveTrack(); trackLine.addLatLng([p.lat,p.lon]);
+      }
+    }
+    updateStats(pos);
+    $("gpsState").textContent="測位中";
+    $("message").textContent="GPSを受信しています。精度は周囲の環境や端末により変動します。";
+    if($("follow").checked) map.panTo([p.lat,p.lon], {animate:false});
+  }
+  function onError(err){
+    const messages={1:"位置情報の利用が許可されていません。Safariの設定を確認してください。",2:"現在位置を取得できません。",3:"GPS取得がタイムアウトしました。"};
+    $("gpsState").textContent="GPSエラー";
+    $("message").textContent=messages[err.code] || err.message;
+  }
+  function startGPS(){
+    if(!("geolocation" in navigator)){ $("message").textContent="このブラウザは位置情報に対応していません。"; return; }
+    if(!window.isSecureContext){ $("message").textContent="GPS利用にはHTTPSで公開されたページが必要です。"; return; }
+    if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+    watchId=navigator.geolocation.watchPosition(onPosition,onError,{enableHighAccuracy:true,maximumAge:1000,timeout:20000});
+  }
+  function stopGPS(){
+    if(watchId!==null){navigator.geolocation.clearWatch(watchId);watchId=null;}
+  }
+  function renderTrack(){
+    trackLine.setLatLngs(track.map(p=>[p.lat,p.lon]));
+    $("points").textContent=track.length.toLocaleString("ja-JP");
+    $("distance").textContent=(totalDistance()/1000).toFixed(2)+" km";
+    if(track.length){lastPoint=track[track.length-1];}
+  }
+  function downloadCSV(){
+    if(!track.length){$("message").textContent="保存する航跡がありません。";return;}
+    const header=["Time","Latitude","Longitude","Accuracy_m","Speed_mps","Heading_deg"];
+    const rows=track.map(p=>[p.time,p.lat,p.lon,p.accuracy??"",p.speed??"",p.heading??""]);
+    const csv="\uFEFF"+[header,...rows].map(r=>r.join(",")).join("\r\n");
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8"});
+    const url=URL.createObjectURL(blob), a=document.createElement("a");
+    a.href=url; a.download="miyakejima_track_"+new Date().toISOString().replace(/[:.]/g,"-")+".csv";
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+  }
+  $("start").addEventListener("click",()=>{
+    if(!recording){recording=true;paused=false;startGPS();}
+    $("start").disabled=true;$("pause").disabled=false;$("finish").disabled=false;
+    $("gpsState").textContent="GPS取得中";$("message").textContent="航跡を記録しています。Safariを前面に表示して使用してください。";
+  });
+  $("pause").addEventListener("click",()=>{
+    if(recording){recording=false;paused=true;stopGPS();$("pause").textContent="記録再開";$("gpsState").textContent="一時停止";$("message").textContent="記録を一時停止しました。";}
+    else if(paused){recording=true;paused=false;startGPS();$("pause").textContent="一時停止";$("gpsState").textContent="GPS取得中";}
+  });
+  $("finish").addEventListener("click",()=>{
+    recording=false;paused=false;stopGPS();downloadCSV();
+    $("start").disabled=false;$("pause").disabled=true;$("pause").textContent="一時停止";$("finish").disabled=true;
+    $("gpsState").textContent="記録終了";$("message").textContent="航跡CSVを保存しました。記録データはこの端末にも残っています。";
+  });
+  $("center").addEventListener("click",()=>{
+    if(currentMarker) map.setView(currentMarker.getLatLng(), Math.max(map.getZoom(),14));
+    else map.setView(islandCenter,13);
+  });
+  renderTrack();
+  if(track.length) map.fitBounds(trackLine.getBounds().pad(.15));
+  window.addEventListener("pagehide",()=>{ if(recording) saveTrack(); });
+})();
+</script>
+</body>
+</html>
